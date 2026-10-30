@@ -1,0 +1,13 @@
+{
+  "_note": "Example only; install.sh never installs this file. pi-t3 reads profile-template.json, and falls back to Pi's own default model when it is missing or unusable.",
+  "compactor": {
+    "provider": "your-provider",
+    "model": "your-provider/your-model",
+    "thinking": "medium"
+  },
+  "subagent": {
+    "provider": "your-provider",
+    "model": "your-provider/your-model",
+    "thinking": "high"
+  }
+}

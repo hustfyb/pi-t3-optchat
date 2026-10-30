@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# pi-t3-patch-optchat — patch pi-optchat's same-process profile lock handling.
+#
+# T3 Code runs a Pi extension host inside one process per thread and re-opens a
+# profile that this very process already owns. Upstream pi-optchat treats that as
+# a foreign busy profile, so the second open fails with ProfileBusyError. The
+# patch teaches it to skip re-entry when the lock owner is the current PID.
+#
+# License: MIT. See LICENSE.
+set -euo pipefail
+
+AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+SRC="${PI_OPTCHAT_SRC:-$AGENT_DIR/npm/node_modules/pi-optchat/src/index.ts}"
+MODE="${1:---apply}"
+
+case "$MODE" in
+  --check|--apply|--revert) ;;
+  -h|--help)
+    cat <<'EOF'
+Usage: pi-t3-patch-optchat [--check|--apply|--revert]
+
+Patches pi-optchat's same-process profile lock handling for T3 Code.
+  --check   Report whether the source is patchable or already patched.
+  --apply   Apply the patch (default). The original is kept as index.ts.pre-t3patch.
+  --revert  Restore index.ts.pre-t3patch when it exists.
+
+Environment:
+  PI_CODING_AGENT_DIR  Pi agent dir (default: ~/.pi/agent)
+  PI_OPTCHAT_SRC       Explicit path to pi-optchat's src/index.ts
+
+Exit codes for --check:
+  0  patched
+  2  unpatched, all anchors match
+  3  unsupported source shape or incomplete patch
+  4  pi-optchat source not found
+EOF
+    exit 0
+    ;;
+  *)
+    echo "Unknown option: $MODE" >&2
+    exit 64
+    ;;
+esac
+
+python3 - "$SRC" "$MODE" <<'PY'
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+src = Path(sys.argv[1])
+mode = sys.argv[2]
+marker = "optchat.t3-selflock-guard v1"
+
+if not src.is_file():
+    print(f"pi-optchat source not found: {src}", file=sys.stderr)
+    raise SystemExit(4)
+
+text = src.read_text(encoding="utf-8")
+
+# Each anchor is (label, original text, patched text, fragment that proves the
+# anchor is already patched). Anchors are matched exactly; an unknown source
+# shape is refused instead of guessing.
+anchors = [
+    (
+        "A",
+        """      for (;;) {
+        if (!name) { status(ctx); return; }
+        try {
+          if (connect === 'join') joined = await joinProfile(name);
+          else await openProfile(name, ctx);
+          break;
+""",
+        """      for (;;) {
+        if (!name) { status(ctx); return; }
+        if (active?.name === name || openingName === name) break;   // optchat.t3-selflock-guard v1
+        openingName = name;
+        try {
+          if (connect === 'join') joined = await joinProfile(name);
+          else await openProfile(name, ctx);
+          break;
+""",
+        """      for (;;) {
+        if (!name) { status(ctx); return; }
+        if (active?.name === name || openingName === name) break;   // optchat.t3-selflock-guard v1
+        openingName = name;
+""",
+    ),
+    (
+        "B",
+        """        } catch (error) {
+          if (error instanceof ProfileBusyError && connect === 'auto') { joined = await joinProfile(name); break; }
+""",
+        """        } catch (error) {
+          if (openingName === name) openingName = undefined;
+          if (error instanceof ProfileBusyError && error.owner.includes(`· PID ${process.pid} ·`)) break;  // v1
+          if (error instanceof ProfileBusyError && connect === 'auto') { joined = await joinProfile(name); break; }
+""",
+        """        } catch (error) {
+          if (openingName === name) openingName = undefined;
+          if (error instanceof ProfileBusyError && error.owner.includes(`· PID ${process.pid} ·`)) break;  // v1
+""",
+    ),
+    (
+        "C",
+        "  const required = () =>",
+        "  let openingName: string | undefined;   // optchat.t3-selflock-guard v1\n  const required = () =>",
+        "  let openingName: string | undefined;   // optchat.t3-selflock-guard v1\n",
+    ),
+    (
+        "D",
+        "      if (name !== boundName) pi.appendEntry(binding, { name });",
+        "      if (openingName === name) openingName = undefined;\n      if (name !== boundName) pi.appendEntry(binding, { name });",
+        "      if (openingName === name) openingName = undefined;\n",
+    ),
+]
+
+marker_count = text.count(marker)
+unpatched = []
+patched = []
+for label, old, new, patched_fragment in anchors:
+    old_count = text.count(old)
+    patched_ok = patched_fragment in text
+    if patched_ok:
+        patched.append(label)
+    elif old_count == 1:
+        unpatched.append((label, old, new))
+    else:
+        print(
+            f"shape mismatch {label}: expected exactly one unpatched anchor or one patched form "
+            f"(unpatched={old_count}, patched={patched_ok}, marker_count={marker_count})",
+            file=sys.stderr,
+        )
+        raise SystemExit(3)
+
+is_patched = marker_count >= 2 and len(patched) == 4 and not unpatched
+
+if mode == "--check":
+    if is_patched:
+        print(f"patched: {src}")
+        raise SystemExit(0)
+    if not patched and len(unpatched) == 4 and marker_count == 0:
+        print(f"patchable: {src} (pi-optchat 0.10.1-compatible anchors)")
+        raise SystemExit(2)
+    print(
+        f"incomplete or inconsistent patch: markers={marker_count}, "
+        f"patched_anchors={len(patched)}, unpatched_anchors={len(unpatched)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(3)
+
+backup = Path(str(src) + ".pre-t3patch")
+
+if mode == "--revert":
+    if not backup.is_file():
+        if is_patched:
+            print(f"cannot revert without backup: {backup}", file=sys.stderr)
+            raise SystemExit(3)
+        print(f"nothing to revert: {src}")
+        raise SystemExit(0)
+    shutil.copyfile(backup, src)
+    shutil.copystat(backup, src)
+    print(f"reverted: {src}\nfrom: {backup}")
+    raise SystemExit(0)
+
+if is_patched:
+    print(f"already patched: {src}")
+    raise SystemExit(0)
+
+if len(unpatched) != 4:
+    print("refusing to patch an unsupported source shape", file=sys.stderr)
+    raise SystemExit(3)
+
+if not backup.exists():
+    shutil.copy2(src, backup)
+    print(f"backup: {backup}")
+
+updated = text
+for _, old, new, _ in anchors:
+    updated = updated.replace(old, new, 1)
+
+if updated.count(marker) < 2:
+    print("internal error: patched output does not contain the guard markers", file=sys.stderr)
+    raise SystemExit(3)
+
+original_mode = stat.S_IMODE(src.stat().st_mode)
+fd, tmp_name = tempfile.mkstemp(prefix=src.name + ".", suffix=".tmp", dir=src.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+    os.chmod(tmp_name, original_mode)
+    os.replace(tmp_name, src)
+finally:
+    if os.path.exists(tmp_name):
+        os.unlink(tmp_name)
+
+print(f"patched: {src}")
+PY

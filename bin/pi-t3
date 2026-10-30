@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+# pi-t3 — Pi launcher shim for T3 Code.
+#
+# Binds one OptChat profile per T3 thread (workspace cwd) instead of letting
+# every thread in the same project fight over a single profile lock.
+#
+# It injects `--optchat-profile <name>` only for real T3 RPC sessions and
+# otherwise behaves like the real Pi binary (exec passthrough).
+#
+# License: MIT. See LICENSE.
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" >/dev/null 2>&1 && pwd -P)"
+SELF="$(cd "$SELF_DIR" && pwd -P)/$(basename "$SELF")"
+
+canonical_path() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+same_file() {
+  [ "$(canonical_path "$1")" = "$(canonical_path "$2")" ]
+}
+
+SELF_REAL="$(canonical_path "$SELF")"
+SELF_REAL_DIR="$(dirname "$SELF_REAL")"
+
+AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+OPTCHAT_ROOT="${OPTCHAT_HOME:-$HOME/.optchat}"
+PROFILES_ROOT="$OPTCHAT_ROOT/profiles"
+LOG_FILE="$OPTCHAT_ROOT/t3-bindings.log"
+OFF_FILE="$OPTCHAT_ROOT/t3-off"
+SOURCE="$AGENT_DIR/npm/node_modules/pi-optchat/src/index.ts"
+SETTINGS="$AGENT_DIR/settings.json"
+PATCH_SCRIPT="$SELF_REAL_DIR/pi-t3-patch-optchat"
+MARKER="optchat.t3-selflock-guard v1"
+
+# The template lives next to the installed scripts (~/.local/share/pi-t3) or in
+# a source checkout (share/). PI_T3_TEMPLATE always wins.
+TEMPLATE="${PI_T3_TEMPLATE:-}"
+if [ -z "$TEMPLATE" ]; then
+  for candidate in \
+    "$SELF_REAL_DIR/../share/pi-t3/profile-template.json" \
+    "$SELF_REAL_DIR/../share/profile-template.json" \
+    "$HOME/.local/share/pi-t3/profile-template.json"; do
+    if [ -f "$candidate" ]; then
+      TEMPLATE="$(canonical_path "$candidate")"
+      break
+    fi
+  done
+fi
+if [ -z "$TEMPLATE" ]; then
+  TEMPLATE="$HOME/.local/share/pi-t3/profile-template.json"
+fi
+
+REAL_PI=""
+try_real_pi() {
+  local candidate="${1:-}"
+  [ -n "$candidate" ] || return 1
+  [ -f "$candidate" ] && [ -x "$candidate" ] || return 1
+  same_file "$candidate" "$SELF" && return 1
+  REAL_PI="$(canonical_path "$candidate")"
+  [ -n "$REAL_PI" ]
+}
+
+find_real_pi() {
+  local dir candidate
+  if [ -n "${PI_T3_REAL:-}" ] && try_real_pi "$PI_T3_REAL"; then return 0; fi
+
+  if [ -n "${PI_CODING_AGENT_DIR:-}" ] && try_real_pi "$PI_CODING_AGENT_DIR/bin/pi"; then return 0; fi
+  if try_real_pi "$HOME/.pi/agent/bin/pi"; then return 0; fi
+
+  local old_ifs="$IFS"
+  IFS=:
+  for dir in ${PATH:-}; do
+    [ -n "$dir" ] || continue
+    if try_real_pi "$dir/pi"; then
+      IFS="$old_ifs"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+
+  for candidate in \
+    "$HOME"/.local/share/fnm/node-versions/*/installation/bin/pi \
+    "$HOME"/.nvm/versions/node/*/bin/pi \
+    /opt/homebrew/bin/pi \
+    /usr/local/bin/pi \
+    "$HOME/.bun/bin/pi"; do
+    if [ -e "$candidate" ] && try_real_pi "$candidate"; then return 0; fi
+  done
+
+  candidate="$(command -v pi 2>/dev/null || true)"
+  if [ -n "$candidate" ] && ! same_file "$candidate" "$SELF"; then
+    REAL_PI="$(canonical_path "$candidate")"
+    return 0
+  fi
+  return 1
+}
+
+if ! find_real_pi; then
+  printf 'pi-t3: could not find a real Pi binary (wrapper: %s)\n' "$SELF" >&2
+  printf 'pi-t3: set PI_T3_REAL=/absolute/path/to/pi\n' >&2
+  exit 127
+fi
+
+# T3's background service rarely inherits the shell PATH of a version manager
+# (fnm/nvm/volta). Without node, Pi cannot run at all, so make sure it is found.
+ensure_node_path() {
+  command -v node >/dev/null 2>&1 && return 0
+  local candidate
+  for candidate in \
+    "$HOME"/.local/share/fnm/node-versions/*/installation/bin/node \
+    "$HOME"/.local/state/fnm_multishells/*/bin/node \
+    "$HOME"/.nvm/versions/node/*/bin/node \
+    "$HOME/.local/share/pi-node/current/bin/node" \
+    "$HOME/.volta/bin/node" \
+    /opt/homebrew/bin/node \
+    /usr/local/bin/node; do
+    if [ -x "$candidate" ]; then
+      PATH="$(dirname "$candidate"):$PATH"
+      export PATH
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_node_path
+
+record() {
+  local action="$1" reason="${2:-}" name="${3:-}"
+  mkdir -p "$OPTCHAT_ROOT" 2>/dev/null || return 0
+  printf '%s\t%s\treason=%s\tcwd=%s\tname=%s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$action" "$reason" "$(pwd -P 2>/dev/null || pwd)" "$name" \
+    >> "$LOG_FILE" 2>/dev/null || true
+}
+
+passthrough() {
+  local reason="${1:-passthrough}"
+  if [ "${OPTCHAT_T3_DEBUG:-0}" = "1" ]; then record "passthrough" "$reason"; fi
+  if [ "${PI_T3_DRY_RUN:-0}" = "1" ]; then
+    printf 'PI_T3_DRY_RUN passthrough reason=%q real=%q args=' "$reason" "$REAL_PI"
+    printf '%q ' ${args[@]+"${args[@]}"}
+    printf '\n'
+    exit 0
+  fi
+  exec "$REAL_PI" ${args[@]+"${args[@]}"}
+}
+
+args=("$@")
+argc=${#args[@]}
+has_rpc=0
+has_user_profile=0
+blocked_reason=""
+explicit_session=""
+
+i=0
+while [ "$i" -lt "$argc" ]; do
+  arg="${args[$i]}"
+  case "$arg" in
+    --mode)
+      if [ $((i + 1)) -lt "$argc" ] && [ "${args[$((i + 1))]}" = "rpc" ]; then has_rpc=1; fi
+      i=$((i + 2))
+      continue
+      ;;
+    --mode=rpc) has_rpc=1 ;;
+    --optchat-profile|--optchat-profile=*) has_user_profile=1 ;;
+    --session)
+      if [ $((i + 1)) -lt "$argc" ]; then explicit_session="${args[$((i + 1))]}"; fi
+      ;;
+    --session=*) explicit_session="${arg#--session=}" ;;
+    --no-extensions|-ne|--no-session|--fork|--fork=*|--print|-p|--resume|-r|--resume=*|--session-id|--session-id=*|--export|--export=*|--help|-h|--version|-v)
+      [ -n "$blocked_reason" ] || blocked_reason="$arg"
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+if [ "$has_rpc" -eq 0 ]; then passthrough not-rpc; fi
+if [ -z "${T3_PI_MCP_EXTENSION_PATH:-}" ]; then passthrough no-t3-mcp-env; fi
+if [ "$has_user_profile" -eq 1 ]; then passthrough user-profile; fi
+if [ -n "$blocked_reason" ]; then passthrough "blocked-flag:$blocked_reason"; fi
+if [ -e "$OFF_FILE" ]; then record "skip-off" "t3-off exists"; passthrough t3-off; fi
+if [ "${OPTCHAT_T3_AUTOBIND:-1}" = "0" ]; then record "skip-disabled" "OPTCHAT_T3_AUTOBIND=0"; passthrough disabled; fi
+
+if ! grep -q '"npm:pi-optchat"' "$SETTINGS" 2>/dev/null || [ ! -f "$SOURCE" ]; then
+  record "skip-no-optchat" "$SOURCE"
+  passthrough optchat-not-installed
+fi
+
+patch_ok=0
+if [ -f "$PATCH_SCRIPT" ]; then
+  if bash "$PATCH_SCRIPT" --check >/dev/null 2>&1; then patch_ok=1; fi
+else
+  if [ "$(grep -c "$MARKER" "$SOURCE" 2>/dev/null || true)" -ge 2 ]; then patch_ok=1; fi
+fi
+if [ "$patch_ok" -ne 1 ] && [ "${OPTCHAT_T3_REQUIRE_PATCH:-1}" != "0" ]; then
+  record "skip-unpatched" "run pi-t3-patch-optchat"
+  passthrough optchat-unpatched
+fi
+
+session_root="${PI_CODING_AGENT_SESSION_DIR:-$AGENT_DIR/sessions}"
+cwd="$(pwd -P 2>/dev/null || pwd)"
+encoded="$(printf '%s' "$cwd" | sed 's|^[/\\]||; s|[/\\:]|-|g')"
+session_dir="$session_root/--$encoded--"
+
+find_binding() {
+  local target="$1"
+  python3 - "$target" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+if target.is_file():
+    files = [target]
+elif target.is_dir():
+    files = sorted(
+        (p for p in target.iterdir() if p.is_file() and p.suffix == ".jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+else:
+    files = []
+
+for path in files:
+    name = None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "optchat.profile" not in line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except Exception:
+                    continue
+                if value.get("type") == "custom" and value.get("customType") == "optchat.profile":
+                    data = value.get("data")
+                    if isinstance(data, dict) and isinstance(data.get("name"), str):
+                        name = data["name"]
+    except OSError:
+        continue
+    if name is not None:
+        print(name)
+        raise SystemExit(0)
+raise SystemExit(3)
+PY
+}
+
+# A profile is usable when both optchat slots are complete. `main` is optional:
+# OptChat itself writes a legitimate `main` into config.json at runtime, so only
+# a malformed `main` is dropped (in place) instead of discarding the profile.
+normalize_config() {
+  python3 - "$1" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+path = root / "config.json"
+thinking = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+def choice(value):
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("provider"), str)
+        and bool(value["provider"])
+        and isinstance(value.get("model"), str)
+        and bool(value["model"])
+        and value.get("thinking") in thinking
+    )
+
+try:
+    config = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(3)
+if not isinstance(config, dict) or not choice(config.get("compactor")) or not choice(config.get("subagent")):
+    raise SystemExit(3)
+if "main" in config and not choice(config.get("main")):
+    config.pop("main", None)
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    print("stripped-invalid-main")
+else:
+    print("config-ok")
+raise SystemExit(0)
+PY
+}
+
+lock_state() {
+  python3 - "$1" <<'PY'
+import errno
+import os
+import socket
+import sys
+
+path = sys.argv[1] + "/lock.sock"
+if not os.path.exists(path):
+    print("idle")
+    raise SystemExit(0)
+try:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(1.0)
+    sock.connect(path)
+    try:
+        data = sock.recv(4096).decode("utf-8", "replace").strip()
+    except Exception:
+        data = "owner did not reply"
+    print("busy\t" + (data or "owner replied"))
+    raise SystemExit(1)
+except (ConnectionRefusedError, FileNotFoundError):
+    print("idle")
+    raise SystemExit(0)
+except OSError as exc:
+    if exc.errno in (errno.ECONNREFUSED, errno.ENOENT):
+        print("idle")
+        raise SystemExit(0)
+    print("busy\t" + str(exc))
+    raise SystemExit(1)
+finally:
+    try:
+        sock.close()
+    except Exception:
+        pass
+PY
+}
+
+write_config() {
+  local name="$1" dir="$2"
+  python3 - "$name" "$dir" "${OPTCHAT_T3_SEED:-}" "$TEMPLATE" "$SETTINGS" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+name, dest, seed, template, settings_path = sys.argv[1:6]
+thinking = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+def choice(value):
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("provider"), str)
+        and bool(value["provider"])
+        and isinstance(value.get("model"), str)
+        and bool(value["model"])
+        and value.get("thinking") in thinking
+    )
+
+def load(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    if not choice(value.get("compactor")) or not choice(value.get("subagent")):
+        return None
+    value.pop("main", None)
+    return value
+
+candidates = []
+if seed:
+    seed_path = Path(seed).expanduser()
+    candidates.append(seed_path / "config.json" if seed_path.is_dir() else seed_path)
+candidates.append(Path(template).expanduser())
+
+config = None
+for candidate in candidates:
+    config = load(candidate)
+    if config is not None:
+        break
+
+if config is None:
+    try:
+        settings = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+    except Exception:
+        settings = {}
+    provider = settings.get("defaultProvider")
+    model = settings.get("defaultModel")
+    level = settings.get("defaultThinkingLevel")
+    if level not in thinking:
+        level = "medium"
+    if isinstance(provider, str) and provider and isinstance(model, str) and model:
+        config = {
+            "compactor": {"provider": provider, "model": model, "thinking": level},
+            "subagent": {"provider": provider, "model": model, "thinking": "high"},
+        }
+
+if config is None:
+    print("no valid seed, template, or Pi default model", file=sys.stderr)
+    raise SystemExit(3)
+
+if not choice(config.get("compactor")) or not choice(config.get("subagent")):
+    print("selected config is invalid", file=sys.stderr)
+    raise SystemExit(3)
+
+out = Path(dest) / "config.json"
+tmp = out.with_name(out.name + f".tmp.{os.getpid()}")
+tmp.write_text(json.dumps(config, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+os.replace(tmp, out)
+PY
+}
+
+create_profile() {
+  local name="$1"
+  local dir="$PROFILES_ROOT/$name"
+  mkdir -p "$PROFILES_ROOT" || return 1
+  chmod 700 "$PROFILES_ROOT" 2>/dev/null || true
+  (umask 077; mkdir "$dir" 2>/dev/null) || return 1
+  if ! write_config "$name" "$dir"; then
+    rm -rf "$dir"
+    return 1
+  fi
+  printf '# %s\n\nThis profile is bound to a T3 Code thread by pi-t3.\nAdd profile-specific instructions here.\n' "$name" > "$dir/AGENTS.md"
+  chmod 600 "$dir/config.json" "$dir/AGENTS.md" 2>/dev/null || true
+  return 0
+}
+
+# Repair an existing binding without ever throwing away a usable profile:
+#   1. valid (with or without `main`) -> keep, only re-create a missing AGENTS.md;
+#   2. malformed `main`             -> strip `main` in place;
+#   3. broken compactor/subagent    -> move the profile aside and re-mint.
+# A profile whose lock socket is served by a live process is never touched.
+repair_profile() {
+  local name="$1"
+  local dir="$PROFILES_ROOT/$name"
+
+  case "$name" in t3-*) ;; *) return 0 ;; esac
+
+  if printf '%s' "$name" | grep -qv '^[a-z0-9][a-z0-9_-]\{0,63\}$'; then
+    record "skip-repair" "unsafe-profile-name" "$name"
+    return 0
+  fi
+
+  if [ -d "$dir" ]; then
+    local normalize_result=""
+    if normalize_result="$(normalize_config "$dir" 2>/dev/null)"; then
+      if [ ! -f "$dir/AGENTS.md" ]; then
+        printf '# %s\n\nThis profile is bound to a T3 Code thread by pi-t3.\nAdd profile-specific instructions here.\n' "$name" > "$dir/AGENTS.md"
+        chmod 600 "$dir/AGENTS.md" 2>/dev/null || true
+        record "repaired-instructions" "recreated AGENTS.md" "$name"
+      fi
+      if [ "$normalize_result" = "stripped-invalid-main" ]; then
+        record "repaired-config" "removed invalid main" "$name"
+      fi
+      return 0
+    fi
+    if ! lock_state "$dir" >/dev/null 2>&1; then
+      record "skip-repair" "profile-locked" "$name"
+      return 0
+    fi
+    local bad
+    bad="$dir.bad.$(date '+%Y%m%d-%H%M%S')"
+    if mv "$dir" "$bad"; then
+      record "repaired-config" "moved-to=$(basename "$bad")" "$name"
+    else
+      record "skip-repair" "move-failed" "$name"
+      return 0
+    fi
+  fi
+
+  if create_profile "$name"; then
+    record "repaired-profile" "recreated" "$name"
+  else
+    record "skip-repair" "recreate-failed" "$name"
+  fi
+}
+
+if [ -n "$explicit_session" ]; then
+  case "$explicit_session" in
+    /*) session_target="$explicit_session" ;;
+    *) session_target="$cwd/$explicit_session" ;;
+  esac
+  bound_name="$(find_binding "$session_target" 2>/dev/null || true)"
+else
+  bound_name="$(find_binding "$session_dir" 2>/dev/null || true)"
+fi
+
+if [ -n "$bound_name" ]; then
+  repair_profile "$bound_name"
+  record "no-inject-bound" "session already has optchat.profile" "$bound_name"
+  passthrough existing-binding
+fi
+
+slug="$(basename "$cwd" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/^-*//; s/-*$//')"
+if [ -z "$slug" ]; then slug="root"; fi
+if [ "${#slug}" -gt 16 ]; then
+  slug="${slug:${#slug}-16:16}"
+fi
+
+name=""
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  suffix="$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+  candidate="t3-$slug-$suffix"
+  if [ ! -e "$PROFILES_ROOT/$candidate" ]; then
+    name="$candidate"
+    break
+  fi
+  attempt=$((attempt + 1))
+done
+
+if [ -z "$name" ]; then
+  record "skip-mint" "could-not-allocate-profile-name"
+  passthrough profile-name-collision
+fi
+
+if ! create_profile "$name"; then
+  record "skip-no-config" "profile-creation-failed" "$name"
+  passthrough profile-creation-failed
+fi
+
+record "minted" "new-t3-thread" "$name"
+
+injected=()
+inserted=0
+for arg in "$@"; do
+  if [ "$arg" = "--" ] && [ "$inserted" -eq 0 ]; then
+    injected+=(--optchat-profile "$name")
+    inserted=1
+  fi
+  injected+=("$arg")
+done
+if [ "$inserted" -eq 0 ]; then
+  injected+=(--optchat-profile "$name")
+fi
+
+record "invoke" "injected" "$name"
+
+if [ "${PI_T3_DRY_RUN:-0}" = "1" ]; then
+  printf 'PI_T3_DRY_RUN real=%q name=%q args=' "$REAL_PI" "$name"
+  printf '%q ' "${injected[@]}"
+  printf '\n'
+  exit 0
+fi
+
+exec "$REAL_PI" "${injected[@]}"

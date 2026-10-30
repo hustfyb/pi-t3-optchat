@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# pi-t3-doctor — report the state of a pi-t3 installation.
+#
+#   pi-t3-doctor                 full report (exit 1 when attention is required)
+#   pi-t3-doctor name <cwd|dir>  print the OptChat profile bound to that thread
+#
+# License: MIT. See LICENSE.
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" >/dev/null 2>&1 && pwd -P)"
+
+canonical_path() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+SCRIPT_DIR="$(dirname "$(canonical_path "$SCRIPT_DIR/$(basename "$SELF")")")"
+WRAPPER="$SCRIPT_DIR/pi-t3"
+PATCH_SCRIPT="$SCRIPT_DIR/pi-t3-patch-optchat"
+
+AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+OPTCHAT_ROOT="${OPTCHAT_HOME:-$HOME/.optchat}"
+PROFILES_ROOT="$OPTCHAT_ROOT/profiles"
+SESSION_ROOT="${PI_CODING_AGENT_SESSION_DIR:-$AGENT_DIR/sessions}"
+SOURCE="$AGENT_DIR/npm/node_modules/pi-optchat/src/index.ts"
+T3_SETTINGS="${T3_SETTINGS:-$HOME/.t3/userdata/settings.json}"
+TEMPLATE="${PI_T3_TEMPLATE:-}"
+if [ -z "$TEMPLATE" ]; then
+  for candidate in \
+    "$SCRIPT_DIR/../share/pi-t3/profile-template.json" \
+    "$SCRIPT_DIR/../share/profile-template.json" \
+    "$HOME/.local/share/pi-t3/profile-template.json"; do
+    if [ -f "$candidate" ]; then
+      TEMPLATE="$(canonical_path "$candidate")"
+      break
+    fi
+  done
+fi
+
+encode_cwd() {
+  printf '%s' "$1" | sed 's|^[/\\]||; s|[/\\:]|-|g'
+}
+
+binding_for_target() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+if target.is_file():
+    files = [target]
+elif target.is_dir():
+    files = sorted(
+        (p for p in target.iterdir() if p.is_file() and p.suffix == ".jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+else:
+    files = []
+
+for path in files:
+    found = None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "optchat.profile" not in line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except Exception:
+                    continue
+                if value.get("type") == "custom" and value.get("customType") == "optchat.profile":
+                    data = value.get("data")
+                    if isinstance(data, dict) and isinstance(data.get("name"), str):
+                        found = data["name"]
+    except OSError:
+        continue
+    if found:
+        print(f"{found}\t{path}")
+raise SystemExit(0)
+PY
+}
+
+if [ "${1:-}" = "name" ]; then
+  target="${2:-$(pwd -P)}"
+  if [ ! -e "$target" ]; then
+    target="$SESSION_ROOT/--$(encode_cwd "$target")--"
+  elif [ -d "$target" ]; then
+    case "$(basename "$target")" in
+      --*--) ;;
+      *)
+        encoded_target="$SESSION_ROOT/--$(encode_cwd "$(cd "$target" && pwd -P)")--"
+        if [ -d "$encoded_target" ]; then target="$encoded_target"; fi
+        ;;
+    esac
+  fi
+  result="$(binding_for_target "$target")"
+  if [ -n "$result" ]; then
+    printf '%s\n' "$result"
+  else
+    printf 'No OptChat binding found for %s\n' "$target" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+critical=0
+printf 'pi-t3 doctor\n'
+printf '============\n\n'
+
+printf 'Wrapper\n'
+printf '  path: %s\n' "$WRAPPER"
+if [ -x "$WRAPPER" ]; then printf '  executable: yes\n'; else printf '  executable: NO\n'; critical=1; fi
+printf '  template: %s\n' "${TEMPLATE:-<not found>}"
+printf '  agent dir: %s\n' "$AGENT_DIR"
+printf '  optchat home: %s\n' "$OPTCHAT_ROOT"
+printf '  session root: %s\n\n' "$SESSION_ROOT"
+
+printf 'OptChat and patch\n'
+if [ -f "$SOURCE" ]; then
+  version="$(jq -r '.version // "unknown"' "$(dirname "$(dirname "$SOURCE")")/package.json" 2>/dev/null || true)"
+  printf '  source: %s\n' "$SOURCE"
+  printf '  version: %s\n' "${version:-unknown}"
+else
+  printf '  source: MISSING\n'
+  critical=1
+fi
+if [ -f "$PATCH_SCRIPT" ]; then
+  patch_output="$(bash "$PATCH_SCRIPT" --check 2>&1)"
+  patch_status=$?
+  case "$patch_status" in
+    0) printf '  patch: patched OK\n' ;;
+    2) printf '  patch: NOT PATCHED - run pi-t3-patch-optchat\n'; critical=1 ;;
+    *) printf '  patch: ERROR\n'; critical=1 ;;
+  esac
+  printf '  check: %s\n' "$patch_output"
+else
+  printf '  patch script: MISSING\n'
+  critical=1
+fi
+printf '\n'
+
+printf 'Profile template\n'
+if [ -n "${TEMPLATE:-}" ] && [ -f "$TEMPLATE" ]; then
+  if jq -e '
+    def choice:
+      (type == "object")
+      and ((.provider | type) == "string") and ((.provider | length) > 0)
+      and ((.model | type) == "string") and ((.model | length) > 0)
+      and (.thinking as $t | (["off","minimal","low","medium","high","xhigh","max"] | index($t)) != null);
+    (has("main") | not) and (.compactor | choice) and (.subagent | choice)
+  ' "$TEMPLATE" >/dev/null 2>&1; then
+    printf '  %s: valid (no main)\n' "$TEMPLATE"
+  else
+    printf '  %s: unusable (placeholder, broken, or contains main)\n' "$TEMPLATE"
+    printf '  note: new profiles will be seeded from Pi default model settings instead\n'
+  fi
+else
+  printf '  no template found: new profiles will use Pi default model settings\n'
+fi
+printf '\n'
+
+printf 'T3 Pi provider\n'
+if [ -f "$T3_SETTINGS" ]; then
+  jq -r '
+    (.providerInstances.pi // {}) as $pi |
+    "  enabled: \($pi.enabled // "unset")\n" +
+    "  binaryPath: \($pi.config.binaryPath // "<unset>")\n" +
+    "  launchArgs: \($pi.config.launchArgs // "<unset>")"
+  ' "$T3_SETTINGS" 2>/dev/null || printf '  could not parse settings\n'
+  configured="$(jq -r '.providerInstances.pi.config.binaryPath // empty' "$T3_SETTINGS" 2>/dev/null)"
+  if [ -z "$configured" ]; then
+    printf '  warning: Pi provider is not configured\n'
+    critical=1
+  elif [ "$(canonical_path "$configured")" != "$(canonical_path "$WRAPPER")" ]; then
+    printf '  warning: binaryPath does not point at this wrapper\n'
+    critical=1
+  fi
+  launch_args="$(jq -r '.providerInstances.pi.config.launchArgs // empty' "$T3_SETTINGS" 2>/dev/null)"
+  if [ -n "$launch_args" ]; then
+    printf '  warning: launchArgs should be empty\n'
+    critical=1
+  fi
+else
+  printf '  T3 settings not found: %s\n' "$T3_SETTINGS"
+  critical=1
+fi
+printf '\n'
+
+printf 'Wrapper log (last 12)\n'
+if [ -f "$OPTCHAT_ROOT/t3-bindings.log" ]; then
+  tail -12 "$OPTCHAT_ROOT/t3-bindings.log" | sed 's/^/  /'
+else
+  printf '  no decisions recorded yet\n'
+fi
+printf '\n'
+
+printf 'Running Pi processes\n'
+found_pi=0
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  pid="${line%% *}"
+  command="${line#* }"
+  case "$command" in
+    *pi-t3*) label="pi-t3 launcher" ;;
+    *pi-optchat*|*--mode*rpc*) label="Pi RPC" ;;
+    *) label="Pi" ;;
+  esac
+  cwd=""
+  if [ -d "/proc/$pid" ]; then
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+  elif command -v lsof >/dev/null 2>&1; then
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+  fi
+  printf '  %s  %-14s cwd=%s\n' "$pid" "$label" "${cwd:-unknown}"
+  found_pi=1
+done < <(ps -axo pid=,command= 2>/dev/null | awk '
+  $2 == "pi" || $2 ~ /(^|\/)pi$/ || $2 ~ /pi-coding-agent/ || $2 ~ /\/pi-t3$/ { print }
+')
+if [ "$found_pi" -eq 0 ]; then printf '  none\n'; fi
+printf '\n'
+
+printf 'Profiles and locks\n'
+profiles_jq='
+  def choice:
+    (type == "object")
+    and ((.provider | type) == "string") and ((.provider | length) > 0)
+    and ((.model | type) == "string") and ((.model | length) > 0)
+    and (.thinking as $t | (["off","minimal","low","medium","high","xhigh","max"] | index($t)) != null);
+  ((has("main") | not) or (.main | choice)) and (.compactor | choice) and (.subagent | choice)
+'
+if [ -d "$PROFILES_ROOT" ]; then
+  found_profile=0
+  for dir in "$PROFILES_ROOT"/*; do
+    [ -d "$dir" ] || continue
+    found_profile=1
+    name="$(basename "$dir")"
+    config_state="valid"
+    jq -e "$profiles_jq" "$dir/config.json" >/dev/null 2>&1 || config_state="invalid"
+    if [ ! -f "$dir/AGENTS.md" ]; then config_state="$config_state,no-agents"; fi
+    lock="free"
+    socket="$dir/lock.sock"
+    if [ -S "$socket" ]; then
+      owner="$(python3 - "$socket" <<'PY'
+import socket
+import sys
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(0.7)
+try:
+    s.connect(sys.argv[1])
+    try:
+        print(s.recv(4096).decode("utf-8", "replace").strip() or "owner replied")
+    except Exception:
+        print("owner replied")
+except (ConnectionRefusedError, FileNotFoundError):
+    print("stale socket")
+except Exception as exc:
+    print(f"unreachable: {exc}")
+finally:
+    s.close()
+PY
+)"
+      lock="$owner"
+    fi
+    printf '  %-40s config=%-16s lock=%s\n' "$name" "$config_state" "$lock"
+  done
+  if [ "$found_profile" -eq 0 ]; then printf '  no profiles yet\n'; fi
+else
+  printf '  no profiles yet\n'
+fi
+printf '\n'
+
+printf 'Session bindings by cwd\n'
+python3 - "$SESSION_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+if not root.is_dir():
+    print("  no session directory yet")
+    raise SystemExit(0)
+
+rows = []
+for session_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name):
+    bindings = set()
+    files = sorted(
+        (p for p in session_dir.iterdir() if p.is_file() and p.suffix == ".jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if "optchat.profile" not in line:
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except Exception:
+                        continue
+                    if value.get("type") == "custom" and value.get("customType") == "optchat.profile":
+                        data = value.get("data")
+                        if isinstance(data, dict) and isinstance(data.get("name"), str):
+                            bindings.add(data["name"])
+        except OSError:
+            continue
+    if bindings:
+        rows.append((session_dir.name, ", ".join(sorted(bindings))))
+
+if not rows:
+    print("  none")
+for name, bindings in rows:
+    print(f"  {name} -> {bindings}")
+PY
+printf '\n'
+
+if [ -e "$OPTCHAT_ROOT/t3-off" ]; then
+  printf 'Autobind is OFF: remove %s to re-enable\n' "$OPTCHAT_ROOT/t3-off"
+fi
+
+if [ "$critical" -ne 0 ]; then
+  printf '\nResult: attention required\n'
+  exit 1
+fi
+printf '\nResult: basic checks passed\n'
