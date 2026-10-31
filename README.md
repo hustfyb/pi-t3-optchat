@@ -6,6 +6,11 @@
 
 `pi-t3` 是一个 Pi 启动垫片（launcher shim）：T3 把 Pi 的 `binaryPath` 指向它，它只在「真的是 T3 的 RPC 会话」时注入一个线程级 profile，其它情况（CLI 交互、`--print`、`--resume`……）原样 `exec` 真正的 Pi。
 
+> **更简单的做法（推荐先看）**：`hustfyb/optchat-t3` 是 pi-optchat 的分支，加了 `--optchat-profile auto`
+> —— 按 session 派生出 `t3-<目录>-<session前8位>` 的 profile，并修掉了同进程重开时的崩溃。
+> 用它只需要 `pi install git:github.com/hustfyb/optchat-t3` + T3 里填 `--optchat-profile auto`，
+> **不需要本仓库的 wrapper，也不需要打补丁**。本仓库保留给仍在 pi-optchat 0.10.1、或需要按 cwd 命名 profile 的场景。
+
 ```text
 T3 Code (每条线程一个 Pi 进程)
         │  spawn: pi-t3 --mode rpc ...
