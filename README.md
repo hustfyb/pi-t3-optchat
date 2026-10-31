@@ -1,5 +1,7 @@
 # pi-t3
 
+[![ci](https://github.com/hustfyb/pi-t3-optchat/actions/workflows/ci.yml/badge.svg)](https://github.com/hustfyb/pi-t3-optchat/actions/workflows/ci.yml)
+
 让 **T3 Code** 里的每一条 Pi 线程拥有自己的 **OptChat** profile —— 不需要改 T3 源码，也不需要给每条线程手工建 profile。
 
 `pi-t3` 是一个 Pi 启动垫片（launcher shim）：T3 把 Pi 的 `binaryPath` 指向它，它只在「真的是 T3 的 RPC 会话」时注入一个线程级 profile，其它情况（CLI 交互、`--print`、`--resume`……）原样 `exec` 真正的 Pi。
